@@ -14,8 +14,8 @@ a8"     "8a           88          88
               
                                               (c) 2012 by Jonah Fox (weepy), MIT Licensed */
 
-var VERSION = "0.2.7"
-  , slice = Array.prototype.slice
+var VERSION = "0.3.2"
+  , slice = [].slice
   , Events = {  
   /*
   * Create an immutable callback list, allowing traversal during modification. The tail is an empty object that will always be used as the next node.
@@ -46,17 +46,25 @@ var VERSION = "0.2.7"
       delete this._callbacks;
     } else if (calls = this._callbacks) {
       events = events.split(/\s+/);
+      var lastnode
       while (ev = events.shift()) {
         node = calls[ev];
-        delete calls[ev];
+        //delete calls[ev];
         if (!callback || !node) continue;
 
         // Create a new list, omitting the indicated event/context pairs.
 
         while ((node = node.next) && node.next) {
           if (node.callback === callback &&
-            (!context || node.context === context)) continue;
-          this.on(ev, node.callback, node.context);
+            (!context || node.context === context)) {
+              if (lastnode)
+                lastnode.next = node.next
+              else
+                calls[ev] = node.next
+              continue
+          };
+          lastnode = node
+          //this.on(ev, node.callback, node.context);
         }
       }
     }
@@ -85,14 +93,13 @@ var VERSION = "0.2.7"
     while (node = events.pop()) {
      tail = node.tail;
       args = node.event ? [node.event].concat(rest) : rest;
-      while ((node = node.next) !== tail) {
+      while ((node = node.next) !== tail && node.callback) {
         node.callback.apply(node.context || this, args);
       }
     }
     return this;
   }
 }
-
 
  /*
   * Public function to return an observable property
@@ -118,9 +125,9 @@ var propertyMethods = {
     return this
   },
   toString: function() { 
-    return '<' + (this.type ? this.type + ':' : '') + this.value + '>'
+    return JSON.stringify(this.value)
   },
-  bind: function(el) {
+  bindTo: function(el) {
     o_O.bind(this, el)
     return this
   },
@@ -222,6 +229,10 @@ o_O.nextFrame = (function() {
   
 })();
 
+/*
+ * Contains information about current binding
+ */
+o_O.current = {}
 
 /*
  * el: dom element
@@ -231,25 +242,40 @@ o_O.nextFrame = (function() {
  */
 
 
-o_O.bindRuleToElement = function(method, expressionString, context, el) {
+var bindingid = 0
+allbindings = {}
+o_O.bindRuleToElement = function(method, expressionString, context, $el) {
+  
+  var id = ++bindingid
+  allbindings[id] = [method, expressionString, context, $el]
+
   var expression = o_O.expression(expressionString)
     , binding = o_O.createBinding(method)
-    , $el = $(el)
     , value   // contains the current value of the attribute that emit will use
+    , el = $el[0]
+
 
   // if it's an outbound event - just emit immediately and we're done
+  el.bindings = el.bindings || []
+
   if(binding.type == 'outbound') {
     evaluateExpression()
     emit()
+    el.bindings.push(function() {
+      delete allbindings[id]
+    })
     return
   } 
+
+
 
   // otherwise we need to calculate our dependencies
   var deps = dependencies(evaluateExpression)
 
   // if we're not two way and it's a function - then really it's a short hand for missing brackets - recalculate
   if(typeof value == 'function' && binding.type != 'twoway') {
-    expression = o_O.expression('(' + expressionString + ')()')
+    var callString = '.call(this)' // value.constructor == o_O ? '()' : '.call(this)'
+    expression = o_O.expression('(' + expressionString + ')' + callString)
     deps = dependencies(evaluateExpression)
   }
   
@@ -258,19 +284,47 @@ o_O.bindRuleToElement = function(method, expressionString, context, el) {
 
   // and also everytime a dependency changes - but only once per binding per frame - even if > 1 dependency changes 
   var emitting
+    // , disabled
 
-  each(deps, function(dep) {
-    dep.change(function() {
-      evaluateExpression()
-      if(emitting) return // don't queue another 
-      emitting = true
+  function runbinding() {
+    // if(disabled) {
+    //   console.log("skipping disabled")
+    // }
+
+    evaluateExpression()
+    if(emitting) return // don't queue another 
+    emitting = true
+
+    if(binding.immediate ) {
+      emit()
+      emitting = false
+    }
+    else {
       o_O.nextFrame(function() {
         emit()
         emitting = false
       })
-    })
+    }
+  }
+  runbinding.method = method
+  runbinding.id = id
+
+
+  each(deps, function(dep) {
+    dep.on('set', runbinding)
   })
 
+  
+  el.bindings.push(function() {
+    each(deps, function(dep) {
+      
+      dep.off('set', runbinding)
+    })
+    // disabled = true
+    delete allbindings[id]  
+  })
+  
+  //$el.bind('o_O:unbind', unbind)
 
   // evaluates the current expressionString
   function evaluateExpression() { 
@@ -280,9 +334,25 @@ o_O.bindRuleToElement = function(method, expressionString, context, el) {
 
   // emit is the function that actually performs the work
   function emit() {
-    return binding.call(context, value, $el) 
+    if(!allbindings[id]) {
+      console.error("skipping deleted binding", id, method, expressionString, context)
+    }
+      
+    // console.log()
+
+    o_O.current = {
+      context: context,
+      $el: $el,
+      value: value,
+      expression: expressionString,
+      binding: method
+    }
+    var ret = binding.call(context, value, $el) 
+    // o_O.current = {}
+    return ret
   }
 }
+
 
 
 
@@ -312,9 +382,18 @@ function parseBindingAttribute(str) {
  * dom: the element or selector
  * recursing: internal flag to indicate wether it is an internal call
  */
-o_O.bind = function(context, dom, recursing) {
-  var $el = $(dom)
-  if(!recursing) context.el = $el[0]
+
+o_O.bind = function(context, selector, recursing) {
+  var $el = $(selector)
+    , el = $el[0]
+    , $el = $(el)
+
+  o_O.unbind(el)
+
+  if(!recursing) {
+    context.el = $el[0]
+    $el.data('o_O', context)
+  }
   
   var recurse = true
     , pairs = parseBindingAttribute($el.attr(o_O.bindingAttribute))
@@ -324,13 +403,14 @@ o_O.bind = function(context, dom, recursing) {
     var method = pairs[i][0]
       , expression = pairs[i][1]
 
-    if(method == 'with' || method == 'foreach') recurse = false
+    if(method == 'with' || method == 'foreach' || method == 'if' || method == 'unless') recurse = false
     else if(method == '"class"') method = "class"
 
     if(method == 'onbind') {
       onbindings.push([ method, expression, context, $el ])
     }
     else {
+      // console.log('xxx', method, expression, context, $el)
       o_O.bindRuleToElement(method, expression, context, $el)  
     }
     
@@ -347,9 +427,26 @@ o_O.bind = function(context, dom, recursing) {
   for(var i=0; i< onbindings.length; i++) {
     o_O.bindRuleToElement.apply(o_O, onbindings[i])
   }
+
 }
 
+/*
+ * Unbinds all dependencies
+ */
 
+o_O.unbind = function(dom, onlychildren) {
+  if(!dom) return
+
+  if(!onlychildren && dom.bindings) {
+    var fn
+    while(fn = dom.bindings.shift()) 
+      fn()
+  }
+
+  $(dom).children().each(function(i, el) {
+    o_O.unbind(el)
+  })
+}
 
 
 /*
@@ -374,6 +471,19 @@ o_O.helpers = {
       return fn.call(this, $(e.currentTarget).val(), e) 
     }
   },
+  // numeric: function(fn) {
+  //   console.log('numeric', arguments.length, typeof(fn))
+
+  //   if(typeof fn == 'function')
+  //     return function(val) { 
+        
+  //       return arguments.length 
+  //         ? fn( Number(val) )
+  //         : fn()
+  //     }
+  //   else 
+  //     return fn
+  // },
   // converts a mouse event callback to a callback with the mouse position relative to the target
   position: function(fn) {
     return function(e) {
@@ -398,18 +508,38 @@ o_O.bindings = {
   },
   'if': function(context, $el) {
     var template = getTemplate($el)
-    $el.html(context ? template : '')
+    var old_context = this
+    
+    o_O.unbind($el, true)
+
+    if(context) {
+      $el.html(template)
+      $el.children().each(function(i, el) {
+        o_O.bind(old_context, el, true)
+      })
+    }
+    else {
+      $el.html('')
+    }
   },
   unless: function(val, $el) {
     return o_O.bindings['if'](!val, $el)
   },
   'with': function(context, $el) {
     var template = getTemplate($el)
-    $el
-      .html(context ? template : '')
-      .children().each(function(i, el) {
-        o_O.bind(context, el)  
+    
+    o_O.unbind($el, true)
+
+    if(context) {
+      $el.html(template)
+      $el.children().each(function(i, el) {
+        o_O.bind(context, el, true)
       })
+    }
+    else {
+      $el.html('')
+    }
+
   },
   options: function(options, $el) {
     var isArray = options instanceof Array
@@ -436,7 +566,9 @@ o_O.bindings = {
     
     var renderItem = list.renderItem || defaultRenderer
 
+    o_O.unbind($el, true)
     $el.html('')
+
     list.forEach(function(item, index) {
       renderItem.call(list, item, $el, index)
     })
@@ -446,6 +578,11 @@ o_O.bindings = {
     console.log('o_O', context, $el, this)
   }
 }
+
+o_O.bindings['if'].immediate = true
+o_O.bindings['with'].immediate = true
+o_O.bindings['unless'].immediate = true
+o_O.bindings['foreach'].immediate = true
 
 
 /* general purpose
@@ -461,19 +598,37 @@ o_O.bindings.onbind.type = 'outbound'
  * special cases for checkbox
  */
 o_O.bindings.value = function(property, $el) {
+  var self = this
+    , changing = false
+    , in_set_handler = false
+    , checkbox = $el.attr('type') == 'checkbox'
+
   $el.change(function(e) {
-    var checkbox = $(this).attr('type') == 'checkbox'
-      , val = checkbox ? !!$(this).attr('checked') : $(this).val()
-    property(val, e)
+    changing = true
+    if (!in_set_handler) {
+      var val = checkbox ? !!$(this).attr('checked') : $(this).val()
+      property.call(self, val, e)
+    }
+    changing = false
   })
 
   if(property.constructor == o_O) {
     property.on('set', function(val) {
-      $el.attr('type') == 'checkbox'
+      in_set_handler = true
+      checkbox
         ? $el.attr('checked', val ? 'checked' : null)  
         : $el.val(val)
+      
+      if(!changing) $el.change()    
+        in_set_handler = false
     })
-    property.change() // force a change    
+
+    // set without forcing an update
+    var val = property()
+    checkbox
+      ? $el.attr('checked', val ? 'checked' : null)  
+      : $el.val(val)
+
   }
 }
 o_O.bindings.value.type = 'twoway'
@@ -491,6 +646,8 @@ function __bind(func, context) {
     return func.apply(context, arguments)
   }
 }
+
+
 
 o_O.createBinding = function(method) {
   var binding
@@ -514,12 +671,6 @@ o_O.createBinding = function(method) {
   binding.type = binding.type || o_O.bindingTypes[method] || 'inbound'
   return binding
 }
-
-
-
-
-
-
 
 /*         ___   __  __           _      _ 
    ___    / _ \ |  \/  | ___   __| | ___| |
@@ -551,7 +702,8 @@ function model(o, proto) {
    }
   
   proto && extend(this, proto)
-  this.initialize.apply(this, arguments)
+  this.initialize.call(this, o, proto)
+  this.constructor.emit('create', this, o)
 }
 
 extend(model, Events, {
@@ -572,19 +724,13 @@ extend(model, Events, {
     model.properties.push(name)
   },
   defaults: {},
-  types: {},
   extend: function(defaults, protoProps, classProps) {
     defaults = defaults || {}
-    var child = inherits(this, protoProps, classProps);
+    classProps = classProps || {}
+    classProps.extend = classProps.extend || this.extend
+    var child = inherits(this, protoProps, classProps)
     child.defaults = defaults
-    child.extend = this.extend;
-    if(defaults.type) model.types[defaults.type] = child
-    return child;
-  },
-  create: function(o) {
-    var type = model.types[o.type]
-    if(!type) throw new Error('no such Model with type: ' + o.type)
-    return new type(o)
+    return child
   }
 })
 
@@ -592,38 +738,19 @@ extend(model.prototype, Events, {
   toString: function() {
     return '#<'+(this.type ? this.type() : 'model')+'>'
   },
-  bind: function(el) {
+  bindTo: function(el) {
     o_O.bind(this, el);
     return this;
   },
   initialize: function(o) {},
-  valid: function() {
-    return true
-  },
-  // update a json model of named values
-  // if resultant model is invalid - it is set back to previous values
-  // THIS SHOULD BE SIMPLIFIED
+
   update: function(o) {
     var old = {}
-      , props = this.constructor.defaults
     for(var key in o) {
-      if(key in props) {
-        old[key] = this[key].value
-        this[key].value = o[key]
-      }
-    }  
-    if(this.valid()) {
-      for(var key in old) {
-        this[key].value = old[key]
-        this[key](o[key])
-      }
-      this.emit('update', this, o, old)
-      return old
-    } 
-    else {
-      for(var key in old) this[key](old[key])
-      return false
-    }  
+      old = this[key].value
+      this[key](o[key])
+    }
+    this.emit('update', this, o, old)
   },
   destroy: function() {
     this.emit('destroy', this)
@@ -636,9 +763,19 @@ extend(model.prototype, Events, {
   },
   toJSON: function() {
     var json = {}
-    this.each(function(prop, value) {
-      json[prop] = value
-    })
+      , properties = this.properties
+      , jsonExcludes = this.jsonExcludes || []     
+
+    for (var i=0; i < properties.length; i++) {
+      var prop = properties[i]
+
+      if ($.inArray(prop, jsonExcludes) == -1) {        
+        if (typeof(this[prop]) == 'function' && this[prop]() != null) {
+          json[prop] = this[prop]()
+        }        
+      }
+    }
+
     return json
   },
   clone: function() {
@@ -709,14 +846,14 @@ extend(array, {
 extend(array.prototype, Events, {
   type: 'o_O.array',
   initialize: function() {},
-  _onevent : function(ev, o, array) {
-    if ((ev == 'add' || ev == 'remove') && array != this) return
+  _onevent : function(ev, o, arr) {
+    if ((ev == 'add' || ev == 'remove') && arr != this) return
     if (ev == 'destroy') {
       this.remove(o)
     }
     this.emit.apply(this, arguments)
   },
-  bind: function(el) {
+  bindTo: function(el) {
     o_O.bind(this, el)
     return this
   },
@@ -726,7 +863,7 @@ extend(array.prototype, Events, {
   filter: function(fn){
     return this.items.filter(fn)
   },
-  find: function(fn){
+  detect: function(fn){
     for(var i=0;i<this.items.length; i++) {
       var it = this.items[i]
       if(fn(it, i)) return it
@@ -736,7 +873,7 @@ extend(array.prototype, Events, {
     this.count(); // force the dependency
     var ret = []
     for(var i = 0; i < this.length; i++) {
-      var result = fn.call(this, this.items[i], i)
+      var result = fn.call(this, this.at(i), i)
       ret.push(result)
     }
     return ret
@@ -756,6 +893,12 @@ extend(array.prototype, Events, {
   at: function(index) {
     return this.items[index]
   },
+  first: function() {
+    return this.items[0]
+  },
+  last: function() {
+    return this.items[this.items.length - 1]
+  },
   insert: function(o, index) {
     if(index < 0 || index > this.count()) return false
     this.items.splice(index, 0, o)
@@ -763,7 +906,7 @@ extend(array.prototype, Events, {
     return o
   },
   removeAt: function(index) {
-    if(index < 0 || index > this.count()) return false
+    if(index < 0 || index >= this.count()) return false
     var o = this.items[index]
     this.items.splice(index, 1)
     array.remove(this, o, index)
@@ -780,9 +923,22 @@ extend(array.prototype, Events, {
     }
     return func ? items : items[0]
   },
+  empty: function(fn) {
+    var item
+      , items = []
+    while(item = this.shift()) {
+      items.push(item)
+      if(fn) fn(item)
+    }
+    return items
+  },
   renderItem: function(item, $el, index) {
     var $$ = $(getTemplate($el))
-    var nextElem = $el[0].childNodes[index]
+      , children = $el.children()
+
+    if(children[0] && children[0].nodeName == 'TBODY') children = $(children[0]).children()
+
+    var nextElem = children[index]
     nextElem
       ? $$.insertBefore(nextElem)
       : $el.append($$)
@@ -790,14 +946,33 @@ extend(array.prototype, Events, {
   },
   onbind: function($el) {
     var self = this
+    if (!this.addedRenderBindings) {
+      this.addedRenderBindings = true
+      
+      this.on('remove', function(item, arr, index) {
+        // copy with 2 forms of remove event - item,arr,index, and item,index
+        if (typeof(index) == 'undefined') {
+          index = arr
+          arr = self
+        }
+
+        self.removeElement(item, arr, index)
+      })
+    }
+
     this.on('add', function(item, arr, index) {
       self.renderItem(item, $el, index)
     })
-    this.on('remove', this.removeElement, this)
-    this.el = $el[0]
+    
+    this.el = this.el || []
+    this.el.push($el[0])    
   },
-  removeElement: function(item, index) {
-    $(item.el || $(this.el).children()[index]).remove()
+  removeElement: function(item, arr,index) {
+    this.el.forEach(function(element) {      
+      var el = $(element).children()[index]      
+      o_O.unbind(el)
+      $(el).remove()
+    })
   },
   toString: function() {
     return '#<' + this.type + ':' + this.length + '>'
@@ -877,10 +1052,6 @@ function inherits(parent, protoProps, staticProps) {
   return child;
 };
 
-o_O.uuid = function(len) {
-  return Math.random().toString(36).slice(2)
-};
-
 // export and options
 extend(o_O, {
   bindingAttribute: 'data-bind',
@@ -891,12 +1062,9 @@ extend(o_O, {
   VERSION: VERSION
 })
 
-if(typeof module == 'undefined') {
-  var scripts = document.getElementsByTagName('script')
-  var namespace = scripts[scripts.length-1].src.split('?')[1]
-  window[namespace || 'o_O'] = o_O
-} else {
+if(typeof module == 'undefined')
+  window.o_O = o_O
+else
   module.exports = o_O
-}
 
 }();
