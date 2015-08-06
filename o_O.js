@@ -606,7 +606,7 @@ o_O.bindings.value = function(property, $el) {
   $el.change(function(e) {
     changing = true
     if (!in_set_handler) {
-      var val = checkbox ? !!$(this).attr('checked') : $(this).val()
+      var val = checkbox ? !!$(this).prop('checked') : $(this).val()
       property.call(self, val, e)
     }
     changing = false
@@ -616,7 +616,7 @@ o_O.bindings.value = function(property, $el) {
     property.on('set', function(val) {
       in_set_handler = true
       checkbox
-        ? $el.attr('checked', val ? 'checked' : null)  
+        ? $el.prop('checked', val ? 'checked' : null)  
         : $el.val(val)
       
       if(!changing) $el.change()    
